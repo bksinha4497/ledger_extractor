@@ -1,5 +1,23 @@
+# Core data processing
 pandas>=1.3.0
+numpy>=1.20.0
+
+# PDF processing
 pytesseract>=0.3.8
 pdf2image>=1.16.0
 Pillow>=8.0.0
 PyPDF2>=3.0.0
+
+# Natural language processing
+spacy>=3.4.0
+
+# System dependencies note:
+# For pytesseract to work, you need to install Tesseract OCR:
+# - macOS: brew install tesseract
+# - Ubuntu/Debian: sudo apt-get install tesseract-ocr
+# - Windows: Download from https://github.com/UB-Mannheim/tesseract/wiki
+
+# For pdf2image to work, you need to install poppler:
+# - macOS: brew install poppler
+# - Ubuntu/Debian: sudo apt-get install poppler-utils
+# - Windows: Download from https://blog.alivate.com.au/poppler-windows/
