@@ -412,9 +412,10 @@ class AIBankStatementExtractor:
             r'\(([0-9,]+(?:\.[0-9]{1,2})?)\)',                # Negative in parentheses (highest priority)
             r'[\$₹€£¥¢₦R]\s*([0-9,]+(?:\.[0-9]{1,2})?)',     # Currency before
             r'([0-9,]+(?:\.[0-9]{1,2})?)\s*[\$₹€£¥¢₦R]',     # Currency after
-            r'-\s*([0-9,]+(?:\.[0-9]{1,2})?)',               # Negative with minus
+            r'-\s*([0-9,]+(?:\.[0-9]{1,2})?)',               # Negative with minus (but not part of date)
             r'\b([0-9,]+\.[0-9]{2})\b',                       # Decimal amounts with exactly 2 decimals
             r'\b([1-9][0-9,]{3,}(?:\.[0-9]{1,2})?)\b',       # Large amounts starting with non-zero
+            r'\b([1-9][0-9]{2,})\b',                          # 3+ digit amounts (avoid single/double digits)
         ]
         
         # Find date
@@ -432,6 +433,7 @@ class AIBankStatementExtractor:
         
         # Find amounts (avoid overlapping matches)
         amounts = []
+        amount_positions = []  # Track position and amount for better balance detection
         used_positions = set()
         
         for pattern in amount_patterns:
@@ -448,15 +450,24 @@ class AIBankStatementExtractor:
                 # Skip if this looks like a year (4 digits between 1900-2100)
                 if amount_str.isdigit() and 1900 <= int(amount_str) <= 2100:
                     continue
+                    
+                # Skip if this looks like date parts (1-2 digits that are likely day/month)
+                if amount_str.isdigit() and len(amount_str) <= 2 and int(amount_str) <= 31:
+                    continue
                 
                 amount = self.parse_amount(amount_str, is_negative)
                 if amount is not None:
                     amounts.append(amount)
+                    amount_positions.append((start, amount))
                     # Mark positions as used
                     used_positions.update(range(start, end))
         
         if not amounts:
             return None
+            
+        # Sort amounts by position to identify transaction amount vs balance
+        amount_positions.sort(key=lambda x: x[0])
+        amounts = [amount for _, amount in amount_positions]
         
         # Extract description by removing dates and amounts
         description = line
@@ -503,42 +514,88 @@ class AIBankStatementExtractor:
         # Remove the date from the line to process the rest
         remaining_line = line[date_match.end():].strip()
         
-        # Split by multiple spaces to separate fields
-        parts = re.split(r'\s{2,}', remaining_line)
-        if len(parts) < 3:
-            # Fallback: split by single space and try to identify amounts
-            parts = remaining_line.split()
+        # HDFC format has amounts at the end, extract them directly
+        # Look for number patterns in the line (Indian comma formatting)
+        amount_patterns = [
+            r'\b(\d{1,2}(?:,\d{2})*(?:,\d{3})*(?:\.\d{2})?)\b',  # Indian format: 20,79,690.21
+            r'\b(\d{1,3}(?:,\d{3})*(?:\.\d{2})?)\b',             # Western format: 1,234,567.89
+            r'\b(\d+\.\d{2})\b',                                  # Simple decimal: 123.45
+            r'\b(\d{3,})\b'                                       # Large numbers without decimals
+        ]
         
-        # Find amounts in the line (withdrawal, deposit, balance)
         amounts = []
-        amount_pattern = r'^\d{1,3}(?:,\d{3})*(?:\.\d{2})?$'
+        used_positions = set()
         
-        for part in parts[-4:]:  # Look in last 4 parts where amounts usually are
-            if re.match(amount_pattern, part):
+        for pattern in amount_patterns:
+            matches = re.finditer(pattern, remaining_line)
+            for match in matches:
+                start, end = match.span()
+                # Skip overlapping matches
+                if any(pos in range(start, end) for pos in used_positions):
+                    continue
+                    
+                amount_str = match.group(1)
                 try:
-                    amount_val = float(part.replace(',', ''))
-                    amounts.append(amount_val)
+                    amount_val = float(amount_str.replace(',', ''))
+                    
+                    # Filter out values that are likely date components or references
+                    # But keep 0.00 values as they're meaningful in HDFC format
+                    if ((amount_val >= 0.00 and amount_val <= 999999999) and  # Include 0.00 for HDFC
+                        not (1 <= amount_val <= 31 and len(amount_str) <= 2) and  # Skip day/month parts
+                        not (1900 <= amount_val <= 2100 and len(amount_str) == 4)):  # Skip year parts
+                        amounts.append((start, amount_val))
+                        used_positions.update(range(start, end))
                 except ValueError:
                     continue
+        
+        # Sort amounts by position in the line (left to right)
+        amounts.sort(key=lambda x: x[0])
+        amounts = [amt for _, amt in amounts]  # Extract just the amounts
         
         if len(amounts) < 2:
             return None
             
         # HDFC format: [...] Withdrawal_Amt Deposit_Amt Closing_Balance
-        withdrawal_amt = amounts[-3] if len(amounts) >= 3 else 0.0
-        deposit_amt = amounts[-2] if len(amounts) >= 2 else 0.0
-        closing_balance = amounts[-1] if len(amounts) >= 1 else None
+        # The last 3 amounts should be withdrawal, deposit, balance in that order
+        if len(amounts) >= 3:
+            withdrawal_amt = amounts[-3]
+            deposit_amt = amounts[-2] 
+            closing_balance = amounts[-1]
+        elif len(amounts) == 2:
+            # Only 2 amounts found - need to determine the pattern
+            # Usually: [non_zero_transaction_amount, balance] or [0.00, balance]
+            if amounts[0] == 0.0:
+                # First amount is 0, so this might be a credit with 0 withdrawal
+                withdrawal_amt = 0.0
+                deposit_amt = 0.0  # Will be determined from context
+                closing_balance = amounts[1]
+            else:
+                # First amount is non-zero, assume it's a withdrawal and second is balance
+                withdrawal_amt = amounts[0]
+                deposit_amt = 0.0
+                closing_balance = amounts[1]
+        else:
+            return None
         
-        # Calculate net amount (deposit is positive, withdrawal is negative)
-        net_amount = deposit_amt - withdrawal_amt
+        # Note: withdrawal_amt and deposit_amt are used for determining transaction type
         
-        # Extract description (everything between date and amounts)
-        description_parts = []
-        for part in parts[:-3]:  # All parts except the last 3 amounts
-            if not re.match(r'^\d+$', part):  # Skip pure numbers that might be references
-                description_parts.append(part)
+        # Extract description (everything between date and the last few amounts)
+        description = remaining_line
         
-        description = ' '.join(description_parts) if description_parts else "Transaction"
+        # Remove the amounts from the end to get clean description
+        if amounts:
+            # Find the position of the first amount we identified
+            first_amount_pos = remaining_line.rfind(str(amounts[0]).replace('.0', ''))
+            if first_amount_pos == -1:
+                # Try with comma formatting
+                formatted_amount = f"{amounts[0]:,.2f}".rstrip('0').rstrip('.')
+                first_amount_pos = remaining_line.rfind(formatted_amount)
+            
+            if first_amount_pos > 0:
+                description = remaining_line[:first_amount_pos].strip()
+        
+        if not description:
+            description = "Transaction"
         
         # Clean up description
         description = re.sub(r'\s+', ' ', description).strip()
@@ -547,13 +604,26 @@ class AIBankStatementExtractor:
         if len(description) < 3:
             description = "Bank Transaction"
         
-        # Determine transaction type
-        transaction_type = self.classify_transaction(description, net_amount)
+        # Determine transaction type and final amount
+        if withdrawal_amt > 0:
+            # This is a debit transaction - show amount as positive
+            final_amount = withdrawal_amt
+            # Use improved classification, but prioritize HDFC structure
+            transaction_type = self.classify_transaction(description, -withdrawal_amt)
+            if transaction_type == "CREDIT":  # Override if classification disagrees
+                transaction_type = "DEBIT"  # HDFC withdrawal column indicates DEBIT
+        else:
+            # This is a credit transaction - show amount as positive
+            final_amount = deposit_amt
+            # Use improved classification
+            transaction_type = self.classify_transaction(description, deposit_amt)
+            if transaction_type == "DEBIT":  # Override if classification disagrees
+                transaction_type = "CREDIT"  # HDFC deposit column indicates CREDIT
         
         return Transaction(
             date=parsed_date,
             description=description,
-            amount=net_amount,
+            amount=final_amount,
             balance=closing_balance,
             transaction_type=transaction_type
         )
@@ -610,15 +680,30 @@ class AIBankStatementExtractor:
                     
                     date_found, amounts, description = result
                     
-                    # Determine transaction type based on amount and keywords
-                    transaction_type = self.classify_transaction(description, amounts[0])
+                    # Fix amount representation and determine transaction type
+                    original_amount = amounts[0]
+                    
+                    # Convert negative amounts to positive for display
+                    final_amount = abs(original_amount)
+                    
+                    # Use improved classification logic
+                    transaction_type = self.classify_transaction(description, original_amount)
+                    
+                    # Determine balance: use the largest amount as balance if multiple amounts found
+                    balance = None
+                    if len(amounts) > 1:
+                        # Balance is typically the largest amount in the line
+                        balance = max(amounts, key=abs)
+                        # If the balance is the same as transaction amount, try the last amount
+                        if abs(balance - abs(original_amount)) < 0.01:  # Same amount
+                            balance = amounts[-1] if len(amounts) > 1 else None
                     
                     # Create transaction
                     transaction = Transaction(
                         date=date_found,
                         description=description,
-                        amount=amounts[0],
-                        balance=amounts[1] if len(amounts) > 1 else None,
+                        amount=final_amount,
+                        balance=balance,
                         transaction_type=transaction_type
                     )
                     
@@ -636,26 +721,35 @@ class AIBankStatementExtractor:
     
     def classify_transaction(self, description: str, amount: float) -> str:
         """Classify transaction type based on description and amount"""
-        desc_lower = description.lower()
+        description_lower = description.lower()
         
-        # Debit/Credit based on amount
-        base_type = "CREDIT" if amount > 0 else "DEBIT"
+        # Keywords that indicate DEBIT (money going out)
+        debit_keywords = [
+            'payment', 'pay', 'withdraw', 'debit', 'charge', 'fee', 'penalty',
+            'transfer', 'neft', 'rtgs', 'imps', 'pos', 'atm', 'cheque',
+            'emi', 'loan', 'interest debited', 'tax', 'bill', 'purchase', 'buy',
+            'kharcha', 'expense', 'spent', 'paid', 'outward'
+        ]
         
-        # Specific transaction types
-        if any(word in desc_lower for word in ['transfer', 'neft', 'rtgs', 'imps']):
-            return f"{base_type}_TRANSFER"
-        elif any(word in desc_lower for word in ['atm', 'withdrawal', 'cash']):
-            return "ATM_WITHDRAWAL"
-        elif any(word in desc_lower for word in ['deposit', 'cheque', 'check']):
-            return "DEPOSIT"
-        elif any(word in desc_lower for word in ['interest', 'dividend']):
-            return "INTEREST"
-        elif any(word in desc_lower for word in ['fee', 'charge', 'penalty']):
-            return "FEE"
-        elif any(word in desc_lower for word in ['salary', 'payroll']):
-            return "SALARY"
+        # Keywords that indicate CREDIT (money coming in)
+        credit_keywords = [
+            'deposit', 'credit', 'salary', 'refund', 'cashback', 'dividend',
+            'interest received', 'interest credited', 'bonus', 'reward', 'reversal', 'incoming',
+            'received', 'collection', 'income', 'inward'
+        ]
         
-        return base_type
+        # Check for credit keywords first (since they're often more specific)
+        for keyword in credit_keywords:
+            if keyword in description_lower:
+                return "CREDIT"
+                
+        # Check for debit keywords
+        for keyword in debit_keywords:
+            if keyword in description_lower:
+                return "DEBIT"
+        
+        # Fallback: use amount sign (positive = credit, negative = debit)
+        return "CREDIT" if amount > 0 else "DEBIT"
     
     def post_process_transactions(self, transactions: List[Transaction]) -> List[Transaction]:
         """Post-process transactions for consistency and validation"""
